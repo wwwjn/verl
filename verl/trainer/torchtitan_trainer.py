@@ -11,12 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-A lightweight one-file FSDP SFT Trainer
-TODO(zhangchi.usc1992)
-- Add calculation of mfu
-- Add validation
-"""
 
 import os
 
@@ -31,55 +25,39 @@ import torch.distributed
 from tensordict import TensorDict
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torchtitan.config_manager import ConfigManager, JobConfig as TorchTitanEngineConfig
+from torchtitan.experiment.trainer.torchtitan_engine import TorchTitianEngine
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
+from torch.utils.data import Dataset
 
 from verl.utils.dataset import SFTDataset
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.distributed import initialize_global_process_group
 from verl.utils.fs import copy_to_local
-from verl.engine.fsdp.engine_impl import FSDPEngineConfig, FSDPEngine
 from verl.utils.tracking import Tracking
+from transformers import AutoTokenizer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
 
 
-class FSDPSFTTrainer:
-    def __init__(self, config, device_mesh: DeviceMesh, ulysses_device_mesh: DeviceMesh, tokenizer, train_dataset: Dataset, val_dataset: Dataset):
+class TorchTitanSFTTrainer:
+    def __init__(self, config, engine_config: TorchTitanEngineConfig, tokenizer: AutoTokenizer, train_dataset: Dataset, val_dataset: Dataset):
+        # Trainer config
         self.config = config
+
         self.tokenizer = tokenizer
         if self.config.data.chat_template is not None:
             raise ValueError("Apply Chat template from config is not supported yet.")
-        self.device_mesh = device_mesh
-        self.ulysses_device_mesh = ulysses_device_mesh
-        self._build_dataloader(train_dataset, val_dataset)
-        
-        engine_config = FSDPEngineConfig()
-        engine_config.model.path = config.model.partial_pretrain
-        engine_config.model.external_lib = config.model.external_lib
-        engine_config.model.use_rmpad = config.use_remove_padding
+        self.device_mesh = self.engine.world_mesh
 
-        engine_config.optim.type = "adam"
-        engine_config.optim.lr = self.config.optim.lr
-        engine_config.optim.betas = self.config.optim.betas
-        engine_config.optim.weight_decay = self.config.optim.weight_decay
-
-        self.engine = FSDPEngine(engine_config)
+        # only initalize training related configs as part 
+        self.engine = TorchTitianEngine(engine_config)
         self.engine.init_model_and_optimizer()
 
+        self._build_dataloader(train_dataset, val_dataset)
 
-    def _normalize_config_bsz(self):
-        dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
-        if self.device_mesh.get_rank() == 0:
-            print(f"Normalize batch size by dp {dp_size}")
-
-        assert self.config.data.train_batch_size % dp_size == 0, f"Global batch size {self.config.data.train_batch_size} is not divisible by dp size {dp_size}"
-
-        self.config.data.train_batch_size //= dp_size
-
-        assert self.config.data.train_batch_size % self.config.data.micro_batch_size_per_gpu == 0
 
     def _build_dataloader(self, train_dataset, val_dataset):
         # build dataset
@@ -88,34 +66,29 @@ class FSDPSFTTrainer:
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
-
-        # If doing SP, we need to use the local rank and size
-        if self.config.ulysses_sequence_parallel_size > 1:
-            rank = self.ulysses_device_mesh.get_local_rank("dp")
-            world_size = self.ulysses_device_mesh.size(0)
-            if self.ulysses_device_mesh.get_rank() == 0:
-                print(f"Using SP rank {rank} and size {world_size} for data distribution")
-                print("Each SP rank gets different data, but the same data WITHIN the same rank")
+        if self.engine.parallel_dims.dp_enabled:
+            dp_mesh = self.device_mesh["dp"]
+            dp_degree, dp_rank = dp_mesh.size(), dp_mesh.get_local_rank()
         else:
-            rank = self.device_mesh.get_rank()
-            world_size = self.device_mesh.size()
+            dp_degree, dp_rank = 1, 0
+        
         if self.device_mesh.get_rank() == 0:
-            print(f"Using FSDP rank {rank} and size {world_size} for data distribution")
+            print(f"Using DP rank {dp_rank} and size {dp_degree} for dataloader distribution")
 
-        self.train_sampler = DistributedSampler(self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True)
+        self.train_sampler = DistributedSampler(self.train_dataset, shuffle=True, num_replicas=dp_degree, rank=dp_rank, drop_last=True)
         self.train_dataloader = DataLoader(
             dataset=self.train_dataset,
-            batch_size=config.data.train_batch_size,
+            batch_size=config.data.train_batch_size,  # NOTE(jianiw): This is global batch size
             sampler=self.train_sampler,
             num_workers=8,
             pin_memory=True,
             drop_last=True,
         )
 
-        self.val_sampler = DistributedSampler(self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True)
+        self.val_sampler = DistributedSampler(self.val_dataset, shuffle=False, num_replicas=dp_degree, rank=dp_rank, drop_last=True)
         self.val_dataloader = DataLoader(
             dataset=self.val_dataset,
-            batch_size=config.data.micro_batch_size_per_gpu,
+            batch_size=config.data.micro_batch_size_per_gpu, # NOTE(jianiw): This is local batch size
             sampler=self.val_sampler,
             num_workers=8,
             pin_memory=True,
@@ -127,13 +100,23 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(f"Number of steps/epoch {self.steps_per_epoch}, number of epochs {self.config.trainer.total_epochs}, total number of steps {self.total_steps}")
 
+    def _normalize_config_bsz(self):
+        dp_mesh = self.device_mesh["dp"]
+        dp_degree = dp_mesh.size()
+        if self.device_mesh.get_rank() == 0:
+            print(f"Normalize batch size by dp {dp_degree}")
+
+        # NOTE: self.config.data.train_batch_size is global batch size. train_batch_size = dp_degree * micro_batch_size_per_gpu
+        assert self.config.data.train_batch_size % dp_degree == 0, f"Global batch size {self.config.data.train_batch_size} is not divisible by dp size {dp_degree}"
+
+        self.config.data.train_batch_size //= dp_degree
+
+        assert self.config.data.train_batch_size % self.config.data.micro_batch_size_per_gpu == 0
 
     def training_step(self, batch: TensorDict):
-        # self.fsdp_model.train()
 
         log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
 
-        # self.optimizer.zero_grad()
         self.engine.optimizer_zero_grad()
 
         log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
@@ -143,7 +126,7 @@ class FSDPSFTTrainer:
         step_loss = 0
         for micro_batch in micro_batches:
             outputs_loss = self.engine.forward_backward_step(batch=micro_batch)
-            loss = outputs_loss.loss / n_micro_batches
+            loss = outputs_loss / n_micro_batches
             step_loss += loss.item()
 
         self.engine.optimizer_step()
@@ -197,24 +180,25 @@ class FSDPSFTTrainer:
 
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)
 def main(config):
-    local_rank, rank, world_size = initialize_global_process_group()
-    device_mesh = init_device_mesh(device_type="cuda", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
-    dp_size = world_size // config.ulysses_sequence_parallel_size
-    ulysses_device_mesh = init_device_mesh(device_type="cuda", mesh_shape=(dp_size, config.ulysses_sequence_parallel_size), mesh_dim_names=("dp", "sp"))
-
+    
     # build tokenizer and datasets first
     from verl.utils import hf_tokenizer
 
-    local_model_path = copy_to_local(src=config.model.partial_pretrain, verbose=True)
-    tokenizer = hf_tokenizer(local_model_path, trust_remote_code=config.model.trust_remote_code)
-    train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
-    val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
+    # Use official HF tokenzier from https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
+    local_tokenzier_path = copy_to_local(src=config.model.partial_pretrain, verbose=True)
+    tokenizer: AutoTokenizer = hf_tokenizer(local_tokenzier_path, trust_remote_code=config.model.trust_remote_code)
+    train_dataset: Dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
+    val_dataset: Dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
 
-    trainer = FSDPSFTTrainer(config=config, device_mesh=device_mesh, ulysses_device_mesh=ulysses_device_mesh, tokenizer=tokenizer, train_dataset=train_dataset, val_dataset=val_dataset)
+    # Currently, pass CONFIG_PATH to it, and initialize torchtian engine
+    # TODO: Merge the torchtitan config as a subconfig of the sft_trainer main config
+    engine_config_manager = ConfigManager()
+    engine_config = engine_config_manager.parse_args()
+    trainer = TorchTitanSFTTrainer(config=config, engine_config=engine_config, tokenizer=tokenizer, train_dataset=train_dataset, val_dataset=val_dataset)
     trainer.fit()
 
 
-def create_sft_dataset(data_paths, data_config, tokenizer):
+def create_sft_dataset(data_paths, data_config, tokenizer) -> Dataset:
     """Create a dataset."""
     # build dataset
     # First check if a custom dataset class is specified

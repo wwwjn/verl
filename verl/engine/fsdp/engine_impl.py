@@ -153,7 +153,7 @@ class FSDPEngine(Engine):
         outputs.loss = loss
         loss.backward()
 
-        return outputs
+        return outputs.loss
 
 
     def optimizer_zero_grad(self):
