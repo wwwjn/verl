@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-ENTRYPOINT=${ENTRYPOINT:-"-m verl.trainer.fsdp_sft_trainer_v2"}
+ENTRYPOINT=${ENTRYPOINT:-"-m verl.trainer.torchtitan_sft_trainer"}
 
 NUM_GPUS=${NUM_GPUS:-8}
 
-MODEL_ID=${MODEL_ID:-"llama3.1-8B"}
+MODEL_ID=${MODEL_ID:-"meta-llama/Llama-3.1-8B-Instruct"}
 
-# Local model path to load. Now we only support pre-trained model by torchtitan
+
+# NOTE(jianiw): We only use this model path to load tokenzier now
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
+huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
 TRAIN_FILES=${TRAIN_FILES:-$HOME/data/gsm8k/train.parquet}
 VAL_FILES=${VAL_FILES:-$HOME/data/gsm8k/test.parquet}

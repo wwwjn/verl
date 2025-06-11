@@ -48,6 +48,7 @@ optim:
 ulysses_sequence_parallel_size: 1
 use_remove_padding: False
 trainer:
+  torchtitan_config_file: verl/trainer/config/torchtitan_engine.toml
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   default_hdfs_dir: null
   resume_path: null

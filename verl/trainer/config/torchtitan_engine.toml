@@ -46,9 +46,9 @@ context_parallel_degree = 1
 
 [checkpoint]
 enable_checkpoint = true  # Need to be true for loading torchtitan pre-trained model
-folder = "checkpoint"
-exclude_from_loading = "data_loader,lr_scheduler,optimizer"  # load model weights only
-load_step=300
+folder = "/home/jianiw/data/llama3-8b"
+exclude_from_loading= ["optimizer", "lr_scheduler" ,"dataloader"]  # load model weights only
+load_step = 100
 
 
 [activation_checkpoint]

@@ -134,6 +134,7 @@ class FSDPEngine(Engine):
         with context, torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             # Standard forward pass without sequence parallel
             labels = input_ids[:, 1:].contiguous()
+            # NOTE(jianiw): attention_mask, position_ids, etc are parameters from huggingface llama model: https://huggingface.co/docs/transformers/en/model_doc/llama#transformers.LlamaModel.forward
             outputs = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)
             logits = outputs.logits
 

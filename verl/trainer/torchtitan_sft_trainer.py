@@ -26,7 +26,7 @@ from tensordict import TensorDict
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torchtitan.config_manager import ConfigManager, JobConfig as TorchTitanEngineConfig
-from torchtitan.experiment.trainer.torchtitan_engine import TorchTitianEngine
+from torchtitan.experiments.trainer.torchtitan_engine import TorchTitianEngine
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 from torch.utils.data import Dataset
@@ -50,12 +50,13 @@ class TorchTitanSFTTrainer:
         self.tokenizer = tokenizer
         if self.config.data.chat_template is not None:
             raise ValueError("Apply Chat template from config is not supported yet.")
-        self.device_mesh = self.engine.world_mesh
+        
 
         # only initalize training related configs as part 
         self.engine = TorchTitianEngine(engine_config)
         self.engine.init_model_and_optimizer()
 
+        self.device_mesh = self.engine.world_mesh
         self._build_dataloader(train_dataset, val_dataset)
 
 
@@ -159,7 +160,15 @@ class TorchTitanSFTTrainer:
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
 
-        self.engine.set_loss_fn(nn.CrossEntropyLoss(reduction="none"))
+        
+        def cross_entropy_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+            """Common cross-entropy loss function for Transformer models training."""
+            return torch.nn.functional.cross_entropy(
+                pred.flatten(0, 1).float(), labels.flatten(0, 1)
+            )
+
+
+        self.engine.set_loss_fn(cross_entropy_loss)
         for epoch in range(self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
             for data in tqdm(
@@ -193,7 +202,7 @@ def main(config):
     # Currently, pass CONFIG_PATH to it, and initialize torchtian engine
     # TODO: Merge the torchtitan config as a subconfig of the sft_trainer main config
     engine_config_manager = ConfigManager()
-    engine_config = engine_config_manager.parse_args()
+    engine_config = engine_config_manager.parse_args([f"--job.config_file={config.trainer.torchtitan_config_file}"])
     trainer = TorchTitanSFTTrainer(config=config, engine_config=engine_config, tokenizer=tokenizer, train_dataset=train_dataset, val_dataset=val_dataset)
     trainer.fit()
 
